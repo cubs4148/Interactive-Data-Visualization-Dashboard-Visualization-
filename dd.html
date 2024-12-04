@@ -1,0 +1,552 @@
+// This project will be a Data Dashboard with interactive charts and analytics, featuring a backend built with Node.js and MongoDB,
+// and a frontend built with React. This is the core starting point of the project, giving you the ability to expand further.
+
+// For the sake of clarity, I'll break it down into multiple files. This is a full-stack implementation that includes basic functionality.
+
+// Backend (Node.js + Express + MongoDB)
+
+// 1. server.js
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const axios = require('axios'); // To integrate third-party API
+const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer'); // To send email notifications
+const WebSocket = require('ws');
+const app = express();
+
+app.use(express.json());
+app.use(cors());
+
+// Rate Limiting Middleware
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+});
+
+app.use(limiter);
+
+mongoose.connect('mongodb://localhost:27017/data_dashboard', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
+
+const db = mongoose.connection;
+db.on('error', console.error.bind(console, 'connection error:'));
+db.once('open', () => {
+  console.log('Connected to MongoDB');
+});
+
+// Data Schema
+const DataSchema = new mongoose.Schema({
+  label: String,
+  value: Number,
+  date: Date,
+});
+
+const DataPoint = mongoose.model('DataPoint', DataSchema);
+
+// User Schema for Authentication with Role-Based Access
+const UserSchema = new mongoose.Schema({
+  username: String,
+  password: String,
+  role: { type: String, enum: ['admin', 'viewer'], default: 'viewer' },
+});
+
+const User = mongoose.model('User', UserSchema);
+
+// Middleware to verify JWT token
+const authenticateToken = (req, res, next) => {
+  const token = req.headers['authorization'];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, 'secret_key', (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
+
+// Middleware to check admin role
+const checkAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).send('Access denied. Admins only.');
+  }
+  next();
+};
+
+// Routes
+app.post('/api/register', async (req, res) => {
+  const { username, password, role } = req.body;
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const user = new User({ username, password: hashedPassword, role });
+  try {
+    await user.save();
+    res.status(201).send('User registered');
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = await User.findOne({ username });
+  if (!user) return res.status(400).send('User not found');
+
+  const validPassword = await bcrypt.compare(password, user.password);
+  if (!validPassword) return res.status(400).send('Invalid password');
+
+  const token = jwt.sign({ username: user.username, role: user.role }, 'secret_key');
+  res.json({ token });
+});
+
+app.get('/api/data', authenticateToken, async (req, res) => {
+  try {
+    const data = await DataPoint.find({});
+    res.json(data);
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+app.post('/api/data', authenticateToken, checkAdmin, async (req, res) => {
+  const { label, value, date } = req.body;
+  const dataPoint = new DataPoint({ label, value, date });
+  try {
+    await dataPoint.save();
+    res.status(201).send(dataPoint);
+    broadcastData(dataPoint);
+    sendEmailNotification('New data point added', `Label: ${label}, Value: ${value}, Date: ${date}`);
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+// Third-party API Integration Example
+app.get('/api/external-data', authenticateToken, async (req, res) => {
+  try {
+    const response = await axios.get('https://api.coindesk.com/v1/bpi/currentprice.json');
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).send(err);
+  }
+});
+
+// Email Notification Function
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: 'your-email@gmail.com',
+    pass: 'your-email-password',
+  },
+});
+
+const sendEmailNotification = (subject, text) => {
+  const mailOptions = {
+    from: 'your-email@gmail.com',
+    to: 'recipient-email@gmail.com',
+    subject: subject,
+    text: text,
+  };
+
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      console.error('Error sending email:', error);
+    } else {
+      console.log('Email sent:', info.response);
+    }
+  });
+};
+
+// WebSocket for Real-Time Data Updates
+const wss = new WebSocket.Server({ port: 8080 });
+
+const broadcastData = (data) => {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(data));
+    }
+  });
+};
+
+// Server Start
+const PORT = 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
+
+// 2. Frontend (React)
+
+// Install React via Create React App
+// npx create-react-app data-dashboard-frontend
+
+// Inside src folder, create the following:
+
+// 3. App.js
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+import Chart from 'chart.js/auto';
+import { CSVLink } from 'react-csv';
+import './App.css';
+
+function App() {
+  const [data, setData] = useState([]);
+  const [label, setLabel] = useState('');
+  const [value, setValue] = useState('');
+  const [date, setDate] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [token, setToken] = useState('');
+  const [filter, setFilter] = useState('');
+  const [sortBy, setSortBy] = useState('');
+  const [externalData, setExternalData] = useState(null);
+  const [role, setRole] = useState('viewer');
+
+  useEffect(() => {
+    if (token) {
+      axios.get('http://localhost:5000/api/data', {
+        headers: { Authorization: token },
+      }).then((response) => {
+        setData(response.data);
+      });
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (token) {
+      axios.get('http://localhost:5000/api/external-data', {
+        headers: { Authorization: token },
+      }).then((response) => {
+        setExternalData(response.data);
+      });
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (data.length > 0) {
+      let filteredData = filter ? data.filter((d) => d.label.includes(filter)) : data;
+      if (sortBy === 'value') {
+        filteredData = [...filteredData].sort((a, b) => a.value - b.value);
+      } else if (sortBy === 'date') {
+        filteredData = [...filteredData].sort((a, b) => new Date(a.date) - new Date(b.date));
+      }
+      const ctx = document.getElementById('myChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: filteredData.map((d) => d.date.substring(0, 10)),
+          datasets: [
+            {
+              label: 'Data Points',
+              data: filteredData.map((d) => d.value),
+              borderColor: 'rgba(75, 192, 192, 1)',
+              borderWidth: 1,
+            },
+          ],
+        },
+      });
+
+      const ctx2 = document.getElementById('myBarChart').getContext('2d');
+      new Chart(ctx2, {
+        type: 'bar',
+        data: {
+          labels: filteredData.map((d) => d.date.substring(0, 10)),
+          datasets: [
+            {
+              label: 'Data Points',
+              data: filteredData.map((d) => d.value),
+              backgroundColor: 'rgba(75, 192, 192, 0.2)',
+              borderColor: 'rgba(75, 192, 192, 1)',
+              borderWidth: 1,
+            },
+          ],
+        },
+      });
+    }
+  }, [data, filter, sortBy]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    axios
+      .post('http://localhost:5000/api/data', { label, value: parseFloat(value), date }, {
+        headers: { Authorization: token },
+      })
+      .then((response) => {
+        setData([...data, response.data]);
+        setLabel('');
+        setValue('');
+        setDate('');
+      })
+      .catch((err) => {
+        console.error('Error adding data point:', err);
+      });
+  };
+
+  const handleLogin = (e) => {
+    e.preventDefault();
+    axios
+      .post('http://localhost:5000/api/login', { username, password })
+      .then((response) => {
+        setToken(`Bearer ${response.data.token}`);
+        setRole(response.data.role);
+      })
+      .catch((err) => {
+        console.error('Error logging in:', err);
+      });
+  };
+
+  const handleRegister = (e) => {
+    e.preventDefault();
+    axios
+      .post('http://localhost:5000/api/register', { username, password, role })
+      .then(() => {
+        alert('Registration successful, please log in');
+      })
+      .catch((err) => {
+        console.error('Error registering:', err);
+      });
+  };
+
+  return (
+    <div className="App">
+      <h1>Data Dashboard</h1>
+      {!token && (
+        <>
+          <form onSubmit={handleRegister} className="register-form">
+            <input
+              type="text"
+              placeholder="Username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              required
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+            <select value={role} onChange={(e) => setRole(e.target.value)}>
+              <option value="viewer">Viewer</option>
+              <option value="admin">Admin</option>
+            </select>
+            <button type="submit">Register</button>
+          </form>
+          <form onSubmit={handleLogin} className="login-form">
+            <input
+              type="text"
+              placeholder="Username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              required
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+            <button type="submit">Login</button>
+          </form>
+        </>
+      )}
+      {token && (
+        <>
+          {role === 'admin' && (
+            <form onSubmit={handleSubmit} className="data-form">
+              <input
+                type="text"
+                placeholder="Label"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                required
+              />
+              <input
+                type="number"
+                placeholder="Value"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                required
+              />
+              <input
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                required
+              />
+              <button type="submit">Add Data Point</button>
+            </form>
+          )}
+          <input
+            type="text"
+            placeholder="Filter by label"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+          <div className="sort-options">
+            <label>Sort By: </label>
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+              <option value="">None</option>
+              <option value="value">Value</option>
+              <option value="date">Date</option>
+            </select>
+          </div>
+          <canvas id="myChart" width="400" height="200"></canvas>
+          <canvas id="myBarChart" width="400" height="200"></canvas>
+          <CSVLink data={data} filename={"data-export.csv"} className="export-link" target="_blank">
+            Export Data as CSV
+          </CSVLink>
+          {externalData && (
+            <div className="external-data">
+              <h2>Bitcoin Price Index (from Coindesk API)</h2>
+              <p>USD: {externalData.bpi?.USD?.rate}</p>
+              <p>GBP: {externalData.bpi?.GBP?.rate}</p>
+              <p>EUR: {externalData.bpi?.EUR?.rate}</p>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+// 4. App.css
+body {
+  font-family: Arial, sans-serif;
+  background-color: #f0f2f5;
+  margin: 0;
+  padding: 0;
+}
+
+.App {
+  text-align: center;
+  margin-top: 50px;
+}
+
+canvas {
+  margin: auto;
+}
+
+.data-form {
+  margin-bottom: 20px;
+}
+
+.data-form input {
+  margin: 5px;
+  padding: 10px;
+  font-size: 16px;
+}
+
+.data-form button {
+  padding: 10px 20px;
+  font-size: 16px;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  cursor: pointer;
+}
+
+.data-form button:hover {
+  background-color: #0056b3;
+}
+
+.login-form {
+  margin-bottom: 20px;
+}
+
+.login-form input {
+  margin: 5px;
+  padding: 10px;
+  font-size: 16px;
+}
+
+.login-form button {
+  padding: 10px 20px;
+  font-size: 16px;
+  background-color: #28a745;
+  color: white;
+  border: none;
+  cursor: pointer;
+}
+
+.login-form button:hover {
+  background-color: #218838;
+}
+
+.register-form {
+  margin-bottom: 20px;
+}
+
+.register-form input {
+  margin: 5px;
+  padding: 10px;
+  font-size: 16px;
+}
+
+.register-form button {
+  padding: 10px 20px;
+  font-size: 16px;
+  background-color: #17a2b8;
+  color: white;
+  border: none;
+  cursor: pointer;
+}
+
+.register-form button:hover {
+  background-color: #138496;
+}
+
+.sort-options {
+  margin-bottom: 20px;
+}
+
+.sort-options select {
+  padding: 10px;
+  font-size: 16px;
+}
+
+.external-data {
+  margin-top: 20px;
+}
+
+.external-data h2 {
+  font-size: 24px;
+  margin-bottom: 10px;
+}
+
+.external-data p {
+  font-size: 18px;
+  margin: 5px 0;
+}
+
+.export-link {
+  display: block;
+  margin: 20px 0;
+  font-size: 16px;
+  color: #007bff;
+  text-decoration: none;
+}
+
+.export-link:hover {
+  text-decoration: underline;
+}
+
+// To run the app, you need to start both the backend and the frontend:
+// Backend: `node server.js`
+// Frontend: `npm start` inside the React app directory.
+
+// The backend provides the API to store and retrieve data points, while the frontend displays this data in a line chart.
+// This is just a starting point for building a more complex data analytics dashboard. You could add features such as:
+// - User authentication (using JWT)
+// - Adding new data points directly from the frontend
+// - Filtering and sorting data
+// - More complex visualizations with additional charts
+// - Integration with a third-party API for real-time data
+// - Real-time updates using WebSockets
+// - Dashboard customization with drag-and-drop widgets
